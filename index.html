@@ -20,7 +20,7 @@
 </head>
 <body>
 <h1>또박또박</h1>
-<p class="sub">말씀하시면 가능성이 높은 문장 후보를 보여 드려요. 맞는 것을 눌러 선택하세요.</p>
+<p class="sub">말씀하시면 가능성이 높은 문장 3개를 보여 드려요. 맞는 것을 눌러 선택하세요.</p>
 
 <button id="load">1. 모델 불러오기</button>
 <button id="rec" disabled>2. 말하기 시작</button>
@@ -44,8 +44,7 @@ env.allowLocalModels = false;
 
 const $ = id => document.getElementById(id);
 const status = t => $("status").textContent = t;
-let processor, tokenizer, model;
-let stream, audioCtx, source, proc, pcmChunks = [], recording = false, timer;
+let processor, tokenizer, model, recorder, chunks = [], stream, timer;
 
 $("load").onclick = async () => {
   if (!MODEL_ID) { status("index.html의 MODEL_ID가 비어 있어요."); return; }
@@ -71,51 +70,36 @@ $("load").onclick = async () => {
   }
 };
 
-function reset() { $("cands").innerHTML = ""; $("result").hidden = true; $("after").hidden = true; }
-
-function resample(buf, from, to) {
-  if (from === to) return buf;
-  const ratio = from / to, n = Math.floor(buf.length / ratio), out = new Float32Array(n);
-  for (let i = 0; i < n; i++) {
-    const p = i * ratio, i0 = Math.floor(p), i1 = Math.min(i0 + 1, buf.length - 1), f = p - i0;
-    out[i] = buf[i0] * (1 - f) + buf[i1] * f;
-  }
-  return out;
-}
-
-async function startRec() {
-  stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1 } });
-  audioCtx = new AudioContext();
-  source = audioCtx.createMediaStreamSource(stream);
-  proc = audioCtx.createScriptProcessor(4096, 1, 1);
-  pcmChunks = [];
-  proc.onaudioprocess = e => { if (recording) pcmChunks.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
-  source.connect(proc); proc.connect(audioCtx.destination);
-  recording = true;
-}
-
-async function stopRec() {
-  recording = false;
-  clearTimeout(timer);
-  const rate = audioCtx.sampleRate;
-  proc.disconnect(); source.disconnect();
-  stream.getTracks().forEach(t => t.stop());
-  await audioCtx.close();
-  let len = 0; pcmChunks.forEach(c => len += c.length);
-  const all = new Float32Array(len); let o = 0;
-  pcmChunks.forEach(c => { all.set(c, o); o += c.length; });
-  return resample(all, rate, 16000);
+function reset() {
+  $("cands").innerHTML = ""; $("result").hidden = true; $("after").hidden = true;
 }
 
 $("rec").onclick = async () => {
-  if (recording) {
-    $("rec").disabled = true;
+  if (recorder && recorder.state === "recording") { recorder.stop(); return; }
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) {
+    console.error(e);
+    status("마이크를 사용할 수 없어요: " + e.name + " (주소창의 마이크 권한을 확인해 주세요)");
+    return;
+  }
+  reset();
+  chunks = [];
+  recorder = new MediaRecorder(stream);
+  recorder.ondataavailable = e => chunks.push(e.data);
+  recorder.onstop = async () => {
+    clearTimeout(timer);
+    stream.getTracks().forEach(t => t.stop());
     $("rec").textContent = "2. 말하기 시작"; $("rec").classList.remove("rec");
+    $("rec").disabled = true;
     status("후보 문장을 만드는 중...");
     try {
-      const pcm = await stopRec();
-      if (pcm.length < 16000 * 0.5) { status("녹음이 너무 짧아요. 다시 말해 주세요."); $("rec").disabled = false; return; }
-      const inputs = await processor(pcm);
+      const buf = await new Blob(chunks).arrayBuffer();
+      const ctx = new AudioContext({ sampleRate: 16000 });
+      let audio;
+      try { audio = await ctx.decodeAudioData(buf); }
+      finally { ctx.close(); }
+      const inputs = await processor(audio.getChannelData(0));
       const base = { inputs: inputs.input_features, language: "korean", task: "transcribe", max_new_tokens: 64 };
       const seen = new Set();
       const add = o => tokenizer.batch_decode(o, { skip_special_tokens: true })
@@ -126,34 +110,28 @@ $("rec").onclick = async () => {
         add(await model.generate({ ...base, do_sample: true, temperature: 0.8, top_k: 20 }));
       }
       const texts = [...seen].slice(0, 3);
-      if (!texts.length) status("인식된 말이 없어요. 다시 말해 주세요.");
+      if (!texts.length) { status("인식된 말이 없어요. 다시 말해 주세요."); }
       else {
         status("맞는 문장을 눌러 주세요. 없으면 '다시 말하기'를 누르세요.");
         texts.forEach(t => {
           const b = document.createElement("button");
-          b.textContent = t; b.onclick = () => choose(t);
+          b.textContent = t;
+          b.onclick = () => choose(t);
           $("cands").appendChild(b);
         });
-        $("speak").hidden = true; $("after").hidden = false;
+        $("after").hidden = false;
+        $("speak").hidden = true;
       }
     } catch (e) {
       console.error(e);
       status("변환하지 못했어요: " + e.message);
     }
     $("rec").disabled = false;
-    return;
-  }
-  try {
-    reset();
-    await startRec();
-  } catch (e) {
-    console.error(e);
-    status("마이크를 사용할 수 없어요: " + e.name + " (주소창의 마이크 권한을 확인해 주세요)");
-    return;
-  }
+  };
+  recorder.start();
   $("rec").textContent = "말하기 끝내기"; $("rec").classList.add("rec");
   status("듣고 있어요... (최대 15초)");
-  timer = setTimeout(() => recording && $("rec").click(), 15000);
+  timer = setTimeout(() => recorder.state === "recording" && recorder.stop(), 15000);
 };
 
 function choose(t) {
@@ -162,6 +140,7 @@ function choose(t) {
   $("speak").hidden = false; $("after").hidden = false;
   status("선택한 문장이에요.");
 }
+
 $("speak").onclick = () => {
   const t = $("result").textContent.trim(); if (!t) return;
   speechSynthesis.cancel();
