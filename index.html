@@ -96,7 +96,9 @@ $("rec").onclick = async () => {
     try {
       const buf = await new Blob(chunks).arrayBuffer();
       const ctx = new AudioContext({ sampleRate: 16000 });
-      const audio = await ctx.decodeAudioData(buf);
+      let audio;
+      try { audio = await ctx.decodeAudioData(buf); }
+      finally { ctx.close(); }
       const inputs = await processor(audio.getChannelData(0));
       const base = { inputs: inputs.input_features, language: "korean", task: "transcribe", max_new_tokens: 64 };
       const seen = new Set();
